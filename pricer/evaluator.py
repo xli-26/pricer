@@ -1,4 +1,5 @@
 import re
+import time
 from sklearn.metrics import mean_squared_error, r2_score
 import pandas as pd
 import plotly.express as px
@@ -18,6 +19,15 @@ WORKERS = 5
 DEFAULT_SIZE = 200
 
 
+def format_cost(average_cost: float) -> str:
+    """Per-item API cost, shown per 1,000 items while that reads better than a row of zeros."""
+    return f"${average_cost:,.2f} each" if average_cost >= 0.01 else f"${average_cost * 1000:,.3f} per 1k"
+
+
+def format_latency(average_seconds: float) -> str:
+    return f"{average_seconds * 1000:,.0f}ms" if average_seconds < 1 else f"{average_seconds:,.2f}s"
+
+
 class Tester:
     def __init__(self, predictor, data, title=None, size=DEFAULT_SIZE, workers=WORKERS):
         self.predictor = predictor
@@ -29,6 +39,9 @@ class Tester:
         self.truths = []
         self.errors = []
         self.colors = []
+        self.costs = []
+        self.latencies = []
+        self.elapsed = 0.0
         self.workers = workers
 
     @staticmethod
@@ -54,13 +67,15 @@ class Tester:
 
     def run_datapoint(self, i):
         datapoint = self.data[i]
-        value = self.predictor(datapoint)
+        started = time.perf_counter()
+        value, cost = self.predictor(datapoint)
+        latency = time.perf_counter() - started
         guess = self.post_process(value)
         truth = datapoint.price
         error = abs(guess - truth)
         color = self.color_for(error, truth)
         title = datapoint.title if len(datapoint.title) <= 40 else datapoint.title[:40] + "..."
-        return title, guess, truth, error, color
+        return title, guess, truth, error, color, cost, latency
 
     def chart(self, title):
         df = pd.DataFrame(
@@ -194,15 +209,22 @@ class Tester:
 
     def report(self):
         average_error = sum(self.errors) / self.size
+        average_cost = sum(self.costs) / self.size
+        average_latency = sum(self.latencies) / self.size
         mse = mean_squared_error(self.truths, self.guesses)
         r2 = r2_score(self.truths, self.guesses) * 100
-        title = f"{self.title} results<br><b>Error:</b> ${average_error:,.2f} <b>MSE:</b> {mse:,.0f} <b>r²:</b> {r2:.1f}%"
+        title = (
+            f"{self.title} results<br><b>Error:</b> ${average_error:,.2f} "
+            f"<b>MSE:</b> {mse:,.0f} <b>r²:</b> {r2:.1f}% "
+            f"<b>Cost:</b> {format_cost(average_cost)} <b>Time:</b> {format_latency(average_latency)}"
+        )
         self.error_trend_chart()
         self.chart(title)
 
     def run(self):
+        started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            for title, guess, truth, error, color in tqdm(
+            for title, guess, truth, error, color, cost, latency in tqdm(
                 ex.map(self.run_datapoint, range(self.size)), total=self.size
             ):
                 self.titles.append(title)
@@ -210,9 +232,17 @@ class Tester:
                 self.truths.append(truth)
                 self.errors.append(error)
                 self.colors.append(color)
+                self.costs.append(cost)
+                self.latencies.append(latency)
                 print(f"{COLOR_MAP[color]}${error:.0f} ", end="")
+        self.elapsed = time.perf_counter() - started
+        print(
+            f"{RESET}\nTotal API cost ${sum(self.costs):,.4f} for {self.size} items, "
+            f"{self.elapsed:,.1f}s wall clock with {self.workers} workers"
+        )
         self.report()
 
 
 def evaluate(function, data, size=DEFAULT_SIZE, workers=WORKERS):
+    """The predictor is called with an Item and returns (estimate, inference_cost)."""
     Tester(function, data, size=size, workers=workers).run()
